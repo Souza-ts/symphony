@@ -56,6 +56,39 @@ fun LyricsText(
     var lyricsSongId by remember { mutableStateOf<String?>(null) }
     var lyrics by remember { mutableStateOf<TimedContent?>(null) }
 
+    // Função para buscar letras da LrcLib
+    suspend fun fetchLyricsFromLrcLib(artist: String, title: String): String? {
+        return try {
+            val client = HttpClient()
+            // Primeiro busca os resultados da pesquisa
+            val searchResponse: String = client.get(
+                "https://lrclib.net/api/search" +
+                "?artist_name=${URLEncoder.encode(artist, "UTF-8")}" +
+                "&track_name=${URLEncoder.encode(title, "UTF-8")}"
+            ).body()
+            
+            // Parse da resposta JSON
+            val jsonArray = Json.parseToJsonElement(searchResponse).jsonArray
+            if (jsonArray.isNotEmpty()) {
+                // Pega o primeiro resultado (mais relevante)
+                val firstResult = jsonArray.first().jsonObject
+                val lyricsId = firstResult["id"]?.jsonPrimitive?.int
+                
+                lyricsId?.let { id ->
+                    // Busca as letras completas pelo ID
+                    val lyricsResponse: String = client.get("https://lrclib.net/api/get/$id").body()
+                    val lyricsJson = Json.parseToJsonElement(lyricsResponse).jsonObject
+                    lyricsJson["syncedLyrics"]?.jsonPrimitive?.content ?: 
+                    lyricsJson["plainLyrics"]?.jsonPrimitive?.content
+                }
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     LaunchedEffect(LocalContext.current) {
         awaitAll(
             async {
@@ -71,9 +104,24 @@ fun LyricsText(
                         lyricsState = 1
                         lyricsSongId = song?.id
                         coroutineScope.launch {
-                            lyrics = song?.let { song ->
-                                context.symphony.groove.song.getLyrics(song)?.let {
-                                    TimedContent.fromLyrics(it)
+                            // Primeiro tenta buscar da LrcLib
+                            val fetchedLyrics = song?.let {
+                                fetchLyricsFromLrcLib(it.artist, it.title)
+                            }
+                            
+                            if (fetchedLyrics != null) {
+                                // Usa as letras da LrcLib
+                                lyrics = TimedContent.fromLyrics(fetchedLyrics)
+                                // Opcional: salva localmente para uso futuro
+                                song?.id?.let { songId ->
+                                    context.symphony.groove.song.saveLyrics(songId, fetchedLyrics)
+                                }
+                            } else {
+                                // Fallback: busca letras locais
+                                lyrics = song?.let { s ->
+                                    context.symphony.groove.song.getLyrics(s)?.let {
+                                        TimedContent.fromLyrics(it)
+                                    }
                                 }
                             }
                             lyricsState = 2
@@ -89,39 +137,96 @@ fun LyricsText(
         }
     }
 
-    AnimatedContent(
-        label = "lyrics-text",
-        targetState = lyricsState to lyrics,
-        transitionSpec = {
-            FadeTransition.enterTransition()
-                .togetherWith(FadeTransition.exitTransition())
-        },
-    ) { targetState ->
-        val targetLyricsState = targetState.first
-        val targetLyrics = targetState.second
-
-        when {
-            targetLyricsState == 2 && targetLyrics != null -> TimedContentText(
-                content = targetLyrics,
-                duration = playbackPosition.played,
-                padding = padding,
-                style = style,
-                onSeek = {
-                    targetLyrics.pairs.getOrNull(it)?.first?.let { to ->
-                        context.symphony.radio.seek(to)
+    // Botão para forçar busca de letras
+    Column {
+        if (lyricsState == 2 && lyrics == null && song != null) {
+            Button(
+                onClick = {
+                    coroutineScope.launch {
+                        lyricsState = 1
+                        val fetchedLyrics = fetchLyricsFromLrcLib(song.artist, song.title)
+                        if (fetchedLyrics != null) {
+                            lyrics = TimedContent.fromLyrics(fetchedLyrics)
+                            context.symphony.groove.song.saveLyrics(song.id, fetchedLyrics)
+                        }
+                        lyricsState = 2
                     }
-                }
-            )
-
-            else -> Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center,
+                },
+                modifier = Modifier.padding(8.dp).align(Alignment.CenterHorizontally)
             ) {
-                Text(
-                    if (targetLyricsState == 1) context.symphony.t.Loading
-                    else context.symphony.t.NoLyrics
-                )
+                Text("Buscar Letras Online")
+                Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(16.dp))
             }
         }
+
+        AnimatedContent(
+            label = "lyrics-text",
+            targetState = lyricsState to lyrics,
+            transitionSpec = {
+                FadeTransition.enterTransition()
+                    .togetherWith(FadeTransition.exitTransition())
+            },
+        ) { targetState ->
+            val targetLyricsState = targetState.first
+            val targetLyrics = targetState.second
+
+            when {
+                targetLyricsState == 2 && targetLyrics != null -> TimedContentText(
+                    content = targetLyrics,
+                    duration = playbackPosition.played,
+                    padding = padding,
+                    style = style,
+                    onSeek = {
+                        targetLyrics.pairs.getOrNull(it)?.first?.let { to ->
+                            context.symphony.radio.seek(to)
+                        }
+                    }
+                )
+
+                else -> Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (targetLyricsState == 1) {
+                        CircularProgressIndicator()
+                        Spacer(Modifier.width(8.dp))
+                        Text(context.symphony.t.Loading)
+                    } else {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(context.symphony.t.NoLyrics)
+                            Text(
+                                "Tente buscar letras online",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Classe de dados para a resposta da LrcLib (opcional, mas recomendado)
+@Serializable
+data class LrcLibSearchResult(
+    val id: Int,
+    val trackName: String,
+    val artistName: String,
+    val albumName: String?,
+    val duration: Int,
+    val instrumental: Boolean,
+    val plainLyrics: String?,
+    val syncedLyrics: String?,
+    val copyright: String?
+)
+
+// Função de extensão para parsing seguro
+suspend fun HttpClient.getJson(url: String): JsonElement? {
+    return try {
+        val response = this.get(url).body<String>()
+        Json.parseToJsonElement(response)
+    } catch (e: Exception) {
+        null
     }
 }
